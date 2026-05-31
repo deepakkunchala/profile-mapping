@@ -1177,24 +1177,64 @@ def match_juniors_with_seniors(
         r1_score = 0
         r1_load_type = "UNKNOWN"
         r1_industry_overlap = 0
-        
+
         if r1_candidate_scores:
-            selected = r1_candidate_scores[0]
-            r1_senior_id = selected['s_id']
-            r1_score = selected['score']
-            r1_industry_overlap = selected['industry_overlap']
-            
-            # Check for overload (using R1-specific load)
-            if senior_load_r1[r1_senior_id] >= CONFIG['MAX_LOAD_CAP']:
+            # --- PICK FIRST UNDER-CAP CANDIDATE ---
+            # Try to find a senior who hasn't hit MAX_LOAD_CAP yet.
+            selected = None
+            for candidate in r1_candidate_scores:
+                if senior_load_r1[candidate['s_id']] < CONFIG['MAX_LOAD_CAP']:
+                    selected = candidate
+                    break
+
+            # If every candidate in this fallback level is at cap, escalate
+            # through the remaining fallback levels looking for an under-cap senior.
+            if selected is None:
+                for next_level in range(fallback_level_r1 + 1, len(CONFIG['FALLBACK_LEVELS']) + 1):
+                    fallback_log_r1_ext = {'level': None}
+                    ext_candidates, _ = get_fallback_candidates(
+                        jr_segment, df_seniors, senior_segments,
+                        jr_ca, jr_ug, jr_exp, fallback_log_r1_ext
+                    )
+                    # Build scores for the new (wider) candidate pool
+                    ext_scores = []
+                    for sr_idx in ext_candidates:
+                        sr = df_seniors.iloc[sr_idx]
+                        s_id = sr["S_ID"]
+                        score = r1_scores.iloc[jr_idx][s_id]
+                        load = senior_load_r1[s_id]
+                        sr_ind = sr_industries_dict.get(sr_idx, [])
+                        ind_ov = calculate_industry_match(jr_ind, sr_ind)
+                        tb = create_tiebreaker_key(sr_idx, score, load, ind_ov, max_score=100.0)
+                        ext_scores.append({'sr_idx': sr_idx, 's_id': s_id, 'score': score,
+                                           'load': load, 'industry_overlap': ind_ov, 'tiebreaker': tb})
+                    ext_scores.sort(key=lambda x: x['tiebreaker'])
+                    for candidate in ext_scores:
+                        if senior_load_r1[candidate['s_id']] < CONFIG['MAX_LOAD_CAP']:
+                            selected = candidate
+                            fallback_level_r1 = next_level
+                            log_entry['R1']['fallback_level'] = fallback_level_r1
+                            log_entry['R1']['fallback_reason'] = CONFIG['FALLBACK_LEVELS'][fallback_level_r1]
+                            break
+                    if selected is not None:
+                        break
+
+            # Absolute last resort: pick the best-scored candidate even if over cap
+            if selected is None:
+                selected = r1_candidate_scores[0]
                 r1_load_type = "FORCED_OVERLOAD"
             else:
                 r1_load_type = "NORMAL"
-            
+
+            r1_senior_id = selected['s_id']
+            r1_score = selected['score']
+            r1_industry_overlap = selected['industry_overlap']
+
             # Increment ONLY R1 load
             senior_load_r1[r1_senior_id] += 1
             senior_load_total[r1_senior_id] += 1
             senior_assignments_r1[r1_senior_id].append(jr_id)
-            
+
             log_entry['R1']['loads_before'] = senior_load_r1[r1_senior_id] - 1
             log_entry['R1']['loads_after'] = senior_load_r1[r1_senior_id]
         else:
@@ -1260,25 +1300,74 @@ def match_juniors_with_seniors(
         r2_load_type = "UNKNOWN"
         r2_industry_overlap = 0
         same_senior_r1_r2 = False
-        
+
         if r2_candidate_scores:
-            selected = r2_candidate_scores[0]
+            # --- PICK FIRST UNDER-CAP CANDIDATE ---
+            # Prefer a different senior than R1 AND under cap; fall through
+            # progressively: (different + under cap) → (same + under cap) →
+            # escalate fallback for under-cap → forced overload as last resort.
+            selected = None
+            for candidate in r2_candidate_scores:
+                if (not candidate['is_same_r1']) and senior_load_r2[candidate['s_id']] < CONFIG['MAX_LOAD_CAP']:
+                    selected = candidate
+                    break
+
+            # Allow same-as-R1 if no different under-cap senior available
+            if selected is None:
+                for candidate in r2_candidate_scores:
+                    if senior_load_r2[candidate['s_id']] < CONFIG['MAX_LOAD_CAP']:
+                        selected = candidate
+                        break
+
+            # If every candidate in this fallback level is at cap, escalate
+            if selected is None:
+                for next_level in range(fallback_level_r2 + 1, len(CONFIG['FALLBACK_LEVELS']) + 1):
+                    fallback_log_r2_ext = {'level': None}
+                    ext_candidates, _ = get_fallback_candidates(
+                        jr_segment, df_seniors, senior_segments,
+                        jr_ca, jr_ug, jr_exp, fallback_log_r2_ext
+                    )
+                    ext_scores = []
+                    for sr_idx in ext_candidates:
+                        sr = df_seniors.iloc[sr_idx]
+                        s_id = sr["S_ID"]
+                        score = r2_scores.iloc[jr_idx][s_id]
+                        load = senior_load_r2[s_id]
+                        sr_ind = sr_industries_dict.get(sr_idx, [])
+                        ind_ov = calculate_industry_match(jr_ind, sr_ind)
+                        is_same = (s_id == r1_senior_id)
+                        tb = create_tiebreaker_key(sr_idx, score, load, ind_ov, max_score=80.0)
+                        ext_scores.append({'sr_idx': sr_idx, 's_id': s_id, 'score': score,
+                                           'load': load, 'industry_overlap': ind_ov,
+                                           'is_same_r1': is_same, 'tiebreaker': tb})
+                    ext_scores.sort(key=lambda x: (x['is_same_r1'], x['tiebreaker']))
+                    for candidate in ext_scores:
+                        if senior_load_r2[candidate['s_id']] < CONFIG['MAX_LOAD_CAP']:
+                            selected = candidate
+                            fallback_level_r2 = next_level
+                            log_entry['R2']['fallback_level'] = fallback_level_r2
+                            log_entry['R2']['fallback_reason'] = CONFIG['FALLBACK_LEVELS'][fallback_level_r2]
+                            break
+                    if selected is not None:
+                        break
+
+            # Absolute last resort: pick the best-scored candidate even if over cap
+            if selected is None:
+                selected = r2_candidate_scores[0]
+                r2_load_type = "FORCED_OVERLOAD"
+            else:
+                r2_load_type = "NORMAL"
+
             r2_senior_id = selected['s_id']
             r2_score = selected['score']
             r2_industry_overlap = selected['industry_overlap']
             same_senior_r1_r2 = selected['is_same_r1']
-            
-            # Check for overload (using R2-specific load)
-            if senior_load_r2[r2_senior_id] >= CONFIG['MAX_LOAD_CAP']:
-                r2_load_type = "FORCED_OVERLOAD"
-            else:
-                r2_load_type = "NORMAL"
-            
+
             # Increment ONLY R2 load
             senior_load_r2[r2_senior_id] += 1
             senior_load_total[r2_senior_id] += 1
             senior_assignments_r2[r2_senior_id].append(jr_id)
-            
+
             log_entry['R2']['loads_before'] = senior_load_r2[r2_senior_id] - 1
             log_entry['R2']['loads_after'] = senior_load_r2[r2_senior_id]
         else:
