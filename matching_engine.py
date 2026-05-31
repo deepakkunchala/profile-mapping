@@ -681,6 +681,46 @@ def get_fallback_candidates(
         return candidates, 5
 
 
+def get_candidates_for_level(
+    level: int,
+    junior_segment: str,
+    df_seniors: pd.DataFrame,
+    senior_segments: pd.Series,
+    jr_ca: str,
+    jr_ug: str,
+    jr_exp: str,
+) -> List[int]:
+    """
+    Return the senior candidate pool for a *specific* fallback level without
+    re-running the full hierarchy from the top.  Used by the cap-escalation
+    loop so it can genuinely widen the search one level at a time.
+
+    Args:
+        level:           Target fallback level (1-5)
+        junior_segment:  Exact junior segment string
+        df_seniors:      Seniors DataFrame
+        senior_segments: Senior segment Series
+        jr_ca:           Junior CA status
+        jr_ug:           Junior UG category
+        jr_exp:          Junior experience type
+
+    Returns:
+        List of senior DataFrame indices for that level (may be empty).
+    """
+    if level == 1:
+        return df_seniors[senior_segments == junior_segment].index.tolist()
+    elif level == 2:
+        pfx = f"{jr_ca}|{jr_ug}|"
+        return df_seniors[senior_segments.str.startswith(pfx)].index.tolist()
+    elif level == 3:
+        return df_seniors[df_seniors["Undergrad Category"] == jr_ug].index.tolist()
+    elif level == 4:
+        sfx = f"|{jr_ug}|{jr_exp}"
+        return df_seniors[senior_segments.str.endswith(sfx)].index.tolist()
+    else:  # level 5 – global pool
+        return df_seniors.index.tolist()
+
+
 # =============================================================================
 #                    SECTION 8: SEGMENT HEALTH ANALYSIS
 # =============================================================================
@@ -1048,6 +1088,187 @@ def get_confidence_label(score: float, max_score: float = 100.0) -> str:
         return "LOW"
 
 
+def _assign_round(
+    round_name: str,
+    jr_idx: int,
+    junior_row: pd.Series,
+    jr_segment: str,
+    jr_ca: str,
+    jr_ug: str,
+    jr_exp: str,
+    jr_ind: List[str],
+    df_seniors: pd.DataFrame,
+    senior_segments: pd.Series,
+    scores_matrix: pd.DataFrame,
+    sr_industries_dict: Dict[int, List[str]],
+    senior_load: Dict[str, int],
+    senior_load_total: Dict[str, int],
+    senior_assignments: Dict[str, List[str]],
+    log_entry: Dict,
+    r1_senior_id: str,
+    max_score: float,
+    phase1_only: bool = False,
+) -> Tuple[str, float, str, int, int, bool]:
+    """
+    Internal helper that executes the scoring + assignment logic for one round
+    (R1 or R2) for a single junior.
+
+    When ``phase1_only=True`` the function restricts candidates to the junior's
+    **exact segment** (fallback level 1) and returns ``(None, ...)`` without
+    making any assignment if no eligible same-segment senior is found.
+
+    Returns:
+        (senior_id, score, load_type, fallback_level, industry_overlap, same_as_r1)
+        senior_id is None when no assignment was made (phase1_only + no capacity).
+    """
+    is_r2 = (round_name == "R2")
+    fallback_log = {'level': None}
+
+    if phase1_only:
+        # Strict same-segment only — no fallback hierarchy
+        same_seg_candidates = df_seniors[senior_segments == jr_segment].index.tolist()
+        candidates = same_seg_candidates
+        fallback_level = 1
+        fallback_log['level'] = 1
+    else:
+        candidates, fallback_level = get_fallback_candidates(
+            jr_segment, df_seniors, senior_segments,
+            jr_ca, jr_ug, jr_exp, fallback_log
+        )
+
+    log_entry[round_name]['fallback_level'] = fallback_level
+    log_entry[round_name]['fallback_reason'] = CONFIG['FALLBACK_LEVELS'][fallback_level]
+    log_entry[round_name]['candidate_count'] = len(candidates)
+    log_entry[round_name]['candidates_list'] = []
+
+    jr_id = junior_row["J_ID"]
+    candidate_scores = []
+    for sr_idx in candidates:
+        senior_row = df_seniors.iloc[sr_idx]
+        s_id = senior_row["S_ID"]
+        score = scores_matrix.iloc[jr_idx][s_id]
+        load = senior_load[s_id]
+        sr_ind = sr_industries_dict.get(sr_idx, [])
+        industry_overlap = calculate_industry_match(jr_ind, sr_ind)
+        is_same_r1 = is_r2 and (s_id == r1_senior_id)
+        tiebreaker = create_tiebreaker_key(sr_idx, score, load, industry_overlap, max_score=max_score)
+
+        candidate_scores.append({
+            'sr_idx': sr_idx,
+            's_id': s_id,
+            'score': score,
+            'load': load,
+            'industry_overlap': industry_overlap,
+            'is_same_r1': is_same_r1,
+            'tiebreaker': tiebreaker
+        })
+        log_entry[round_name]['candidates_list'].append({
+            'S_ID': s_id,
+            'Score': round(score, 2),
+            f'{round_name}_Load': load,
+            'Industry_Overlap': industry_overlap,
+            **({"Same_as_R1": is_same_r1} if is_r2 else {})
+        })
+
+    if is_r2:
+        candidate_scores.sort(key=lambda x: (x['is_same_r1'], x['tiebreaker']))
+    else:
+        candidate_scores.sort(key=lambda x: x['tiebreaker'])
+
+    log_entry[round_name]['sorted_candidates'] = candidate_scores[:3]
+
+    if not candidate_scores:
+        log_entry[round_name]['error'] = "NO_CANDIDATES"
+        return None, 0, "NO_CANDIDATES", fallback_level, 0, False
+
+    selected = None
+
+    if phase1_only:
+        # Phase 1: only pick if an under-cap same-segment senior exists
+        for candidate in candidate_scores:
+            if senior_load[candidate['s_id']] < CONFIG['MAX_LOAD_CAP']:
+                selected = candidate
+                break
+        if selected is None:
+            # Deferred — will be handled in Phase 2
+            log_entry[round_name]['error'] = "DEFERRED_TO_PHASE2"
+            return None, 0, "DEFERRED", fallback_level, 0, False
+    else:
+        # Phase 2 (full fallback): same logic as before
+        if is_r2:
+            for candidate in candidate_scores:
+                if (not candidate['is_same_r1']) and senior_load[candidate['s_id']] < CONFIG['MAX_LOAD_CAP']:
+                    selected = candidate
+                    break
+            if selected is None:
+                for candidate in candidate_scores:
+                    if senior_load[candidate['s_id']] < CONFIG['MAX_LOAD_CAP']:
+                        selected = candidate
+                        break
+        else:
+            for candidate in candidate_scores:
+                if senior_load[candidate['s_id']] < CONFIG['MAX_LOAD_CAP']:
+                    selected = candidate
+                    break
+
+        # Cap-escalation: widen through fallback levels one at a time
+        if selected is None:
+            for next_level in range(fallback_level + 1, len(CONFIG['FALLBACK_LEVELS']) + 1):
+                ext_candidates = get_candidates_for_level(
+                    next_level, jr_segment, df_seniors, senior_segments,
+                    jr_ca, jr_ug, jr_exp
+                )
+                ext_scores = []
+                for sr_idx in ext_candidates:
+                    sr = df_seniors.iloc[sr_idx]
+                    s_id = sr["S_ID"]
+                    score = scores_matrix.iloc[jr_idx][s_id]
+                    load = senior_load[s_id]
+                    sr_ind = sr_industries_dict.get(sr_idx, [])
+                    ind_ov = calculate_industry_match(jr_ind, sr_ind)
+                    is_same = is_r2 and (s_id == r1_senior_id)
+                    tb = create_tiebreaker_key(sr_idx, score, load, ind_ov, max_score=max_score)
+                    ext_scores.append({'sr_idx': sr_idx, 's_id': s_id, 'score': score,
+                                       'load': load, 'industry_overlap': ind_ov,
+                                       'is_same_r1': is_same, 'tiebreaker': tb})
+                if is_r2:
+                    ext_scores.sort(key=lambda x: (x['is_same_r1'], x['tiebreaker']))
+                else:
+                    ext_scores.sort(key=lambda x: x['tiebreaker'])
+                for candidate in ext_scores:
+                    if senior_load[candidate['s_id']] < CONFIG['MAX_LOAD_CAP']:
+                        selected = candidate
+                        fallback_level = next_level
+                        log_entry[round_name]['fallback_level'] = fallback_level
+                        log_entry[round_name]['fallback_reason'] = CONFIG['FALLBACK_LEVELS'][fallback_level]
+                        break
+                if selected is not None:
+                    break
+
+        # Absolute last resort: overload the best-scored candidate
+        if selected is None:
+            selected = candidate_scores[0]
+            load_type = "FORCED_OVERLOAD"
+        else:
+            load_type = "NORMAL"
+
+    if selected is not None:
+        load_type = load_type if 'load_type' in dir() else "NORMAL"
+        s_id = selected['s_id']
+        senior_load[s_id] += 1
+        senior_load_total[s_id] += 1
+        senior_assignments[s_id].append(jr_id)
+        log_entry[round_name]['loads_before'] = senior_load[s_id] - 1
+        log_entry[round_name]['loads_after'] = senior_load[s_id]
+        log_entry[round_name]['selected'] = s_id
+        log_entry[round_name]['score'] = round(selected['score'], 2)
+        log_entry[round_name]['load_type'] = load_type
+        return (s_id, selected['score'], load_type, fallback_level,
+                selected['industry_overlap'], selected.get('is_same_r1', False))
+
+    return None, 0, "UNKNOWN", fallback_level, 0, False
+
+
 def match_juniors_with_seniors(
     df_juniors: pd.DataFrame,
     df_seniors: pd.DataFrame,
@@ -1058,357 +1279,300 @@ def match_juniors_with_seniors(
     segment_health: pd.DataFrame,
     jr_industries_dict: Dict[int, List[str]],
     sr_industries_dict: Dict[int, List[str]]
-) -> Tuple[pd.DataFrame, List[Dict], pd.DataFrame, Dict, Dict, Dict]:
+) -> Tuple[pd.DataFrame, List[Dict], pd.DataFrame, Dict, Dict, Dict, pd.DataFrame]:
     """
-    Main matching algorithm with separated load tracking for R1 and R2.
-    
-    Improvements:
-    - Separate senior_load_r1 and senior_load_r2 (not combined)
-    - Deterministic tie-breaking when scores are equal
-    - Detailed logging of all decisions
-    - Fair junior processing with shuffling
-    
-    Args:
-        df_juniors: Juniors DataFrame
-        df_seniors: Seniors DataFrame
-        junior_segments: Junior segments Series
-        senior_segments: Senior segments Series
-        r1_scores: Round 1 scoring matrix
-        r2_scores: Round 2 scoring matrix
-        segment_health: Segment health DataFrame
-        jr_industries_dict: Junior industries dict
-        sr_industries_dict: Senior industries dict
-    
+    Two-phase matching algorithm.
+
+    PHASE 1 – Strict Segment Allocation
+        Every junior is matched only against seniors in their own segment (level 1).
+        Juniors that cannot be matched (no same-segment capacity) are collected in
+        ``fallback_juniors`` and left unassigned.
+
+    PHASE 2 – Deferred Fallback Allocation
+        After Phase 1 finishes (all same-segment capacity exhausted first), the
+        deferred juniors are processed using the full fallback hierarchy (levels 2-5).
+        Juniors that still cannot be matched after all fallback levels are placed in
+        ``manual_intervention_cases`` and exported to ``manual_intervention_required.xlsx``.
+
     Returns:
-        Tuple of (results_df, debug_logs, manual_review_df, senior_load_r1, senior_load_r2, senior_load_total)
+        (results_df, debug_logs, manual_review_df,
+         senior_load_r1, senior_load_r2, senior_load_total,
+         manual_intervention_df)
     """
     print("\n" + "="*80)
-    print("STEP 13-16: MATCHING WITH SEPARATED LOAD TRACKING")
+    print("STEP 13-16: TWO-PHASE MATCHING (DEFERRED FALLBACK STRATEGY)")
     print("="*80)
-    
-    # ===== INITIALIZE SEPARATE LOAD TRACKING =====
-    # Each senior has independent load counters for R1 and R2
-    senior_load_r1 = {s_id: 0 for s_id in df_seniors["S_ID"]}
-    senior_load_r2 = {s_id: 0 for s_id in df_seniors["S_ID"]}
+
+    # ===== INITIALIZE LOAD TRACKING =====
+    senior_load_r1    = {s_id: 0 for s_id in df_seniors["S_ID"]}
+    senior_load_r2    = {s_id: 0 for s_id in df_seniors["S_ID"]}
     senior_load_total = {s_id: 0 for s_id in df_seniors["S_ID"]}
-    
     senior_assignments_r1 = {s_id: [] for s_id in df_seniors["S_ID"]}
     senior_assignments_r2 = {s_id: [] for s_id in df_seniors["S_ID"]}
-    
-    results = []
-    debug_logs = []
+
+    results        = []
+    debug_logs     = []
     manual_review_records = []
-    fallback_usage = {}  # Track fallback level usage
-    
-    # Process segments by constraint (most constrained first)
-    segment_order = segment_health.sort_values(by=['Risk_Level', 'Junior_Count'], 
-                                                ascending=[False, False])['Segment'].tolist()
-    
-    print(f"\n  Processing {len(df_juniors)} juniors across segments...")
-    print(f"  Segment order (by constraint): {segment_order[:3]}...")
-    print(f"  Using separate load tracking: R1 load ≠ R2 load")
-    
+
+    # Intermediate stores for two-phase processing
+    phase1_results: Dict[str, Dict] = {}   # jr_id → partial result dict
+    phase1_logs:    Dict[str, Dict] = {}   # jr_id → log_entry
+
+    # Juniors deferred from Phase 1 (no same-segment capacity)
+    fallback_juniors: List[Dict] = []
+
+    # ===========================================================================
+    # PHASE 1 — Strict same-segment matching
+    # ===========================================================================
+    print(f"\n  ── PHASE 1: Strict Segment Allocation ──")
+    print(f"  Processing {len(df_juniors)} juniors (same-segment only)...")
+
     for jr_idx, junior_row in df_juniors.iterrows():
         jr_segment = junior_segments.iloc[jr_idx]
-        jr_id = junior_row["J_ID"]
-        jr_name = junior_row.get('Student Name (FN LN)', '') or "N/A"
-        
+        jr_id      = junior_row["J_ID"]
+        jr_name    = junior_row.get('Student Name (FN LN)', '') or "N/A"
+        jr_ca      = junior_row["Is CA"]
+        jr_ug      = junior_row["Undergrad Category"]
+        jr_exp     = junior_row["ExpType"]
+        jr_ind     = jr_industries_dict.get(jr_idx, [])
+
         log_entry = {
             'J_ID': jr_id,
             'Junior_Name': jr_name,
             'Segment': jr_segment,
+            'Phase': 'Phase1',
             'R1': {}, 'R2': {}
         }
-        
-        # ===== ROUND 1 MATCHING =====
-        jr_ca = junior_row["Is CA"]
-        jr_ug = junior_row["Undergrad Category"]
-        jr_exp = junior_row["ExpType"]
-        jr_ind = jr_industries_dict.get(jr_idx, [])
-        
-        fallback_log_r1 = {'level': None}
-        candidates_r1, fallback_level_r1 = get_fallback_candidates(
-            jr_segment, df_seniors, senior_segments,
-            jr_ca, jr_ug, jr_exp, fallback_log_r1
-        )
-        
-        # Track fallback usage
-        fallback_usage[fallback_level_r1] = fallback_usage.get(fallback_level_r1, 0) + 1
-        
-        log_entry['R1']['fallback_level'] = fallback_level_r1
-        log_entry['R1']['fallback_reason'] = CONFIG['FALLBACK_LEVELS'][fallback_level_r1]
-        log_entry['R1']['candidate_count'] = len(candidates_r1)
-        log_entry['R1']['candidates_list'] = []
-        
-        # Score and rank candidates for R1 with new tie-breaking
-        r1_candidate_scores = []
-        for sr_idx in candidates_r1:
-            senior_row = df_seniors.iloc[sr_idx]
-            s_id = senior_row["S_ID"]
-            score = r1_scores.iloc[jr_idx][s_id]
-            load = senior_load_r1[s_id]  # Use R1-specific load
-            sr_ind = sr_industries_dict.get(sr_idx, [])
-            industry_overlap = calculate_industry_match(jr_ind, sr_ind)
-            
-            # Build tiebreaker key
-            tiebreaker = create_tiebreaker_key(sr_idx, score, load, industry_overlap, max_score=100.0)
-            
-            r1_candidate_scores.append({
-                'sr_idx': sr_idx,
-                's_id': s_id,
-                'score': score,
-                'load': load,
-                'industry_overlap': industry_overlap,
-                'tiebreaker': tiebreaker
+
+        # --- R1 Phase 1 ---
+        r1_senior_id, r1_score, r1_load_type, r1_fallback_level, r1_industry_overlap, _ = \
+            _assign_round(
+                "R1", jr_idx, junior_row, jr_segment,
+                jr_ca, jr_ug, jr_exp, jr_ind,
+                df_seniors, senior_segments,
+                r1_scores, sr_industries_dict,
+                senior_load_r1, senior_load_total, senior_assignments_r1,
+                log_entry, None, max_score=100.0, phase1_only=True
+            )
+
+        # --- R2 Phase 1 ---
+        r2_senior_id, r2_score, r2_load_type, r2_fallback_level, r2_industry_overlap, same_senior_r1_r2 = \
+            _assign_round(
+                "R2", jr_idx, junior_row, jr_segment,
+                jr_ca, jr_ug, jr_exp, jr_ind,
+                df_seniors, senior_segments,
+                r2_scores, sr_industries_dict,
+                senior_load_r2, senior_load_total, senior_assignments_r2,
+                log_entry, r1_senior_id, max_score=80.0, phase1_only=True
+            )
+
+        r1_deferred = (r1_senior_id is None)
+        r2_deferred = (r2_senior_id is None)
+
+        if r1_deferred or r2_deferred:
+            # At least one round needs fallback — park this junior
+            fallback_juniors.append({
+                'jr_idx': jr_idx,
+                'junior_row': junior_row,
+                'jr_segment': jr_segment,
+                'jr_id': jr_id,
+                'jr_name': jr_name,
+                'jr_ca': jr_ca,
+                'jr_ug': jr_ug,
+                'jr_exp': jr_exp,
+                'jr_ind': jr_ind,
+                # Carry forward any partial Phase 1 assignment
+                'r1_senior_id': r1_senior_id,
+                'r1_score': r1_score,
+                'r1_load_type': r1_load_type,
+                'r1_fallback_level': r1_fallback_level,
+                'r1_industry_overlap': r1_industry_overlap,
+                'r2_senior_id': r2_senior_id,
+                'r2_score': r2_score,
+                'r2_load_type': r2_load_type,
+                'r2_fallback_level': r2_fallback_level,
+                'r2_industry_overlap': r2_industry_overlap,
+                'same_senior_r1_r2': same_senior_r1_r2,
+                'log_entry': log_entry,
             })
-            
-            log_entry['R1']['candidates_list'].append({
-                'S_ID': s_id,
-                'Score': round(score, 2),
-                'R1_Load': load,
-                'Industry_Overlap': industry_overlap
-            })
-        
-        # Sort by tiebreaker key (deterministic)
-        r1_candidate_scores.sort(key=lambda x: x['tiebreaker'])
-        log_entry['R1']['sorted_candidates'] = r1_candidate_scores[:3]  # Top 3 for logging
-        
-        r1_senior_id = None
-        r1_score = 0
-        r1_load_type = "UNKNOWN"
-        r1_industry_overlap = 0
-
-        if r1_candidate_scores:
-            # --- PICK FIRST UNDER-CAP CANDIDATE ---
-            # Try to find a senior who hasn't hit MAX_LOAD_CAP yet.
-            selected = None
-            for candidate in r1_candidate_scores:
-                if senior_load_r1[candidate['s_id']] < CONFIG['MAX_LOAD_CAP']:
-                    selected = candidate
-                    break
-
-            # If every candidate in this fallback level is at cap, escalate
-            # through the remaining fallback levels looking for an under-cap senior.
-            if selected is None:
-                for next_level in range(fallback_level_r1 + 1, len(CONFIG['FALLBACK_LEVELS']) + 1):
-                    fallback_log_r1_ext = {'level': None}
-                    ext_candidates, _ = get_fallback_candidates(
-                        jr_segment, df_seniors, senior_segments,
-                        jr_ca, jr_ug, jr_exp, fallback_log_r1_ext
-                    )
-                    # Build scores for the new (wider) candidate pool
-                    ext_scores = []
-                    for sr_idx in ext_candidates:
-                        sr = df_seniors.iloc[sr_idx]
-                        s_id = sr["S_ID"]
-                        score = r1_scores.iloc[jr_idx][s_id]
-                        load = senior_load_r1[s_id]
-                        sr_ind = sr_industries_dict.get(sr_idx, [])
-                        ind_ov = calculate_industry_match(jr_ind, sr_ind)
-                        tb = create_tiebreaker_key(sr_idx, score, load, ind_ov, max_score=100.0)
-                        ext_scores.append({'sr_idx': sr_idx, 's_id': s_id, 'score': score,
-                                           'load': load, 'industry_overlap': ind_ov, 'tiebreaker': tb})
-                    ext_scores.sort(key=lambda x: x['tiebreaker'])
-                    for candidate in ext_scores:
-                        if senior_load_r1[candidate['s_id']] < CONFIG['MAX_LOAD_CAP']:
-                            selected = candidate
-                            fallback_level_r1 = next_level
-                            log_entry['R1']['fallback_level'] = fallback_level_r1
-                            log_entry['R1']['fallback_reason'] = CONFIG['FALLBACK_LEVELS'][fallback_level_r1]
-                            break
-                    if selected is not None:
-                        break
-
-            # Absolute last resort: pick the best-scored candidate even if over cap
-            if selected is None:
-                selected = r1_candidate_scores[0]
-                r1_load_type = "FORCED_OVERLOAD"
-            else:
-                r1_load_type = "NORMAL"
-
-            r1_senior_id = selected['s_id']
-            r1_score = selected['score']
-            r1_industry_overlap = selected['industry_overlap']
-
-            # Increment ONLY R1 load
-            senior_load_r1[r1_senior_id] += 1
-            senior_load_total[r1_senior_id] += 1
-            senior_assignments_r1[r1_senior_id].append(jr_id)
-
-            log_entry['R1']['loads_before'] = senior_load_r1[r1_senior_id] - 1
-            log_entry['R1']['loads_after'] = senior_load_r1[r1_senior_id]
         else:
-            log_entry['R1']['error'] = "NO_CANDIDATES"
-            manual_review_records.append({'J_ID': jr_id, 'Reason': 'No R1 senior found'})
-        
-        log_entry['R1']['selected'] = r1_senior_id
-        log_entry['R1']['score'] = round(r1_score, 2)
-        log_entry['R1']['load_type'] = r1_load_type
-        
-        # ===== ROUND 2 MATCHING =====
-        fallback_log_r2 = {'level': None}
-        candidates_r2, fallback_level_r2 = get_fallback_candidates(
-            jr_segment, df_seniors, senior_segments,
-            jr_ca, jr_ug, jr_exp, fallback_log_r2
-        )
-        
-        log_entry['R2']['fallback_level'] = fallback_level_r2
-        log_entry['R2']['fallback_reason'] = CONFIG['FALLBACK_LEVELS'][fallback_level_r2]
-        log_entry['R2']['candidate_count'] = len(candidates_r2)
-        log_entry['R2']['candidates_list'] = []
-        
-        # Score and rank candidates for R2 with new tie-breaking
-        r2_candidate_scores = []
-        for sr_idx in candidates_r2:
-            senior_row = df_seniors.iloc[sr_idx]
-            s_id = senior_row["S_ID"]
-            score = r2_scores.iloc[jr_idx][s_id]
-            load = senior_load_r2[s_id]  # Use R2-specific load
-            sr_ind = sr_industries_dict.get(sr_idx, [])
-            industry_overlap = calculate_industry_match(jr_ind, sr_ind)
-            
-            # Penalize if same as R1 (but don't exclude)
-            is_same_r1 = (s_id == r1_senior_id)
-            
-            # Build tiebreaker key
-            tiebreaker = create_tiebreaker_key(sr_idx, score, load, industry_overlap, max_score=80.0)
-            
-            r2_candidate_scores.append({
-                'sr_idx': sr_idx,
-                's_id': s_id,
-                'score': score,
-                'load': load,
-                'industry_overlap': industry_overlap,
-                'is_same_r1': is_same_r1,
-                'tiebreaker': tiebreaker
-            })
-            
-            log_entry['R2']['candidates_list'].append({
-                'S_ID': s_id,
-                'Score': round(score, 2),
-                'R2_Load': load,
-                'Industry_Overlap': industry_overlap,
-                'Same_as_R1': is_same_r1
-            })
-        
-        # Sort by: (is_same_r1 first), then tiebreaker
-        r2_candidate_scores.sort(key=lambda x: (x['is_same_r1'], x['tiebreaker']))
-        log_entry['R2']['sorted_candidates'] = r2_candidate_scores[:3]  # Top 3 for logging
-        
-        r2_senior_id = None
-        r2_score = 0
-        r2_load_type = "UNKNOWN"
-        r2_industry_overlap = 0
-        same_senior_r1_r2 = False
+            phase1_results[jr_id] = {
+                'jr_idx': jr_idx,
+                'junior_row': junior_row,
+                'jr_segment': jr_segment,
+                'r1_senior_id': r1_senior_id, 'r1_score': r1_score,
+                'r1_load_type': r1_load_type, 'r1_fallback_level': r1_fallback_level,
+                'r1_industry_overlap': r1_industry_overlap,
+                'r2_senior_id': r2_senior_id, 'r2_score': r2_score,
+                'r2_load_type': r2_load_type, 'r2_fallback_level': r2_fallback_level,
+                'r2_industry_overlap': r2_industry_overlap,
+                'same_senior_r1_r2': same_senior_r1_r2,
+                'log_entry': log_entry,
+            }
 
-        if r2_candidate_scores:
-            # --- PICK FIRST UNDER-CAP CANDIDATE ---
-            # Prefer a different senior than R1 AND under cap; fall through
-            # progressively: (different + under cap) → (same + under cap) →
-            # escalate fallback for under-cap → forced overload as last resort.
-            selected = None
-            for candidate in r2_candidate_scores:
-                if (not candidate['is_same_r1']) and senior_load_r2[candidate['s_id']] < CONFIG['MAX_LOAD_CAP']:
-                    selected = candidate
-                    break
+    print(f"\n  Phase 1 complete:")
+    print(f"    Fully matched (same-segment): {len(phase1_results)}")
+    print(f"    Deferred to Phase 2:          {len(fallback_juniors)}")
 
-            # Allow same-as-R1 if no different under-cap senior available
-            if selected is None:
-                for candidate in r2_candidate_scores:
-                    if senior_load_r2[candidate['s_id']] < CONFIG['MAX_LOAD_CAP']:
-                        selected = candidate
-                        break
+    # ===========================================================================
+    # PHASE 2 — Deferred fallback matching
+    # ===========================================================================
+    print(f"\n  ── PHASE 2: Deferred Fallback Allocation ──")
+    print(f"  Processing {len(fallback_juniors)} deferred juniors (full fallback hierarchy)...")
 
-            # If every candidate in this fallback level is at cap, escalate
-            if selected is None:
-                for next_level in range(fallback_level_r2 + 1, len(CONFIG['FALLBACK_LEVELS']) + 1):
-                    fallback_log_r2_ext = {'level': None}
-                    ext_candidates, _ = get_fallback_candidates(
-                        jr_segment, df_seniors, senior_segments,
-                        jr_ca, jr_ug, jr_exp, fallback_log_r2_ext
+    manual_intervention_cases: List[Dict] = []
+
+    for fb in fallback_juniors:
+        jr_idx        = fb['jr_idx']
+        junior_row    = fb['junior_row']
+        jr_segment    = fb['jr_segment']
+        jr_id         = fb['jr_id']
+        jr_name       = fb['jr_name']
+        jr_ca         = fb['jr_ca']
+        jr_ug         = fb['jr_ug']
+        jr_exp        = fb['jr_exp']
+        jr_ind        = fb['jr_ind']
+        log_entry     = fb['log_entry']
+        log_entry['Phase'] = 'Phase2'
+
+        # Re-use any partial Phase 1 assignment if it was made
+        r1_senior_id        = fb['r1_senior_id']
+        r1_score            = fb['r1_score']
+        r1_load_type        = fb['r1_load_type']
+        r1_fallback_level   = fb['r1_fallback_level']
+        r1_industry_overlap = fb['r1_industry_overlap']
+
+        r2_senior_id        = fb['r2_senior_id']
+        r2_score            = fb['r2_score']
+        r2_load_type        = fb['r2_load_type']
+        r2_fallback_level   = fb['r2_fallback_level']
+        r2_industry_overlap = fb['r2_industry_overlap']
+        same_senior_r1_r2   = fb['same_senior_r1_r2']
+
+        # Only run fallback for rounds that were not assigned in Phase 1
+        if r1_senior_id is None:
+            r1_senior_id, r1_score, r1_load_type, r1_fallback_level, r1_industry_overlap, _ = \
+                _assign_round(
+                    "R1", jr_idx, junior_row, jr_segment,
+                    jr_ca, jr_ug, jr_exp, jr_ind,
+                    df_seniors, senior_segments,
+                    r1_scores, sr_industries_dict,
+                    senior_load_r1, senior_load_total, senior_assignments_r1,
+                    log_entry, None, max_score=100.0, phase1_only=False
+                )
+
+        if r2_senior_id is None:
+            r2_senior_id, r2_score, r2_load_type, r2_fallback_level, r2_industry_overlap, same_senior_r1_r2 = \
+                _assign_round(
+                    "R2", jr_idx, junior_row, jr_segment,
+                    jr_ca, jr_ug, jr_exp, jr_ind,
+                    df_seniors, senior_segments,
+                    r2_scores, sr_industries_dict,
+                    senior_load_r2, senior_load_total, senior_assignments_r2,
+                    log_entry, r1_senior_id, max_score=80.0, phase1_only=False
+                )
+
+        # Check if still unmatched after full fallback
+        r1_unmatched = (r1_senior_id is None)
+        r2_unmatched = (r2_senior_id is None)
+
+        if r1_unmatched or r2_unmatched:
+            # Collect segments that were checked
+            checked_segs = [jr_segment]
+            for lvl in range(2, 6):
+                lvl_cands = get_candidates_for_level(
+                    lvl, jr_segment, df_seniors, senior_segments, jr_ca, jr_ug, jr_exp
+                )
+                if lvl_cands:
+                    checked_segs.extend(
+                        senior_segments.iloc[c] for c in lvl_cands
+                        if senior_segments.iloc[c] not in checked_segs
                     )
-                    ext_scores = []
-                    for sr_idx in ext_candidates:
-                        sr = df_seniors.iloc[sr_idx]
-                        s_id = sr["S_ID"]
-                        score = r2_scores.iloc[jr_idx][s_id]
-                        load = senior_load_r2[s_id]
-                        sr_ind = sr_industries_dict.get(sr_idx, [])
-                        ind_ov = calculate_industry_match(jr_ind, sr_ind)
-                        is_same = (s_id == r1_senior_id)
-                        tb = create_tiebreaker_key(sr_idx, score, load, ind_ov, max_score=80.0)
-                        ext_scores.append({'sr_idx': sr_idx, 's_id': s_id, 'score': score,
-                                           'load': load, 'industry_overlap': ind_ov,
-                                           'is_same_r1': is_same, 'tiebreaker': tb})
-                    ext_scores.sort(key=lambda x: (x['is_same_r1'], x['tiebreaker']))
-                    for candidate in ext_scores:
-                        if senior_load_r2[candidate['s_id']] < CONFIG['MAX_LOAD_CAP']:
-                            selected = candidate
-                            fallback_level_r2 = next_level
-                            log_entry['R2']['fallback_level'] = fallback_level_r2
-                            log_entry['R2']['fallback_reason'] = CONFIG['FALLBACK_LEVELS'][fallback_level_r2]
-                            break
-                    if selected is not None:
-                        break
 
-            # Absolute last resort: pick the best-scored candidate even if over cap
-            if selected is None:
-                selected = r2_candidate_scores[0]
-                r2_load_type = "FORCED_OVERLOAD"
-            else:
-                r2_load_type = "NORMAL"
+            # Best available score across all seniors (informational)
+            all_r1 = [r1_scores.iloc[jr_idx][s] for s in df_seniors["S_ID"]]
+            best_score = max(all_r1) if all_r1 else 0.0
 
-            r2_senior_id = selected['s_id']
-            r2_score = selected['score']
-            r2_industry_overlap = selected['industry_overlap']
-            same_senior_r1_r2 = selected['is_same_r1']
+            reasons = []
+            if r1_unmatched:
+                reasons.append("R1: No eligible senior after full fallback")
+            if r2_unmatched:
+                reasons.append("R2: No eligible senior after full fallback")
 
-            # Increment ONLY R2 load
-            senior_load_r2[r2_senior_id] += 1
-            senior_load_total[r2_senior_id] += 1
-            senior_assignments_r2[r2_senior_id].append(jr_id)
+            manual_intervention_cases.append({
+                'J_ID': jr_id,
+                'Junior_Name': jr_name,
+                'Original_Segment': jr_segment,
+                'Reason_for_Failure': "; ".join(reasons),
+                'Candidate_Segments_Checked': "; ".join(sorted(set(str(s) for s in checked_segs))),
+                'Best_Available_Score': round(best_score, 2),
+            })
 
-            log_entry['R2']['loads_before'] = senior_load_r2[r2_senior_id] - 1
-            log_entry['R2']['loads_after'] = senior_load_r2[r2_senior_id]
-        else:
-            log_entry['R2']['error'] = "NO_CANDIDATES"
-            manual_review_records.append({'J_ID': jr_id, 'Reason': 'No R2 senior found'})
-        
-        log_entry['R2']['selected'] = r2_senior_id
-        log_entry['R2']['score'] = round(r2_score, 2)
-        log_entry['R2']['load_type'] = r2_load_type
-        log_entry['R2']['same_as_r1'] = same_senior_r1_r2
-        
+        # Store result for this deferred junior
+        phase1_results[jr_id] = {
+            'jr_idx': jr_idx,
+            'junior_row': junior_row,
+            'jr_segment': jr_segment,
+            'r1_senior_id': r1_senior_id, 'r1_score': r1_score,
+            'r1_load_type': r1_load_type, 'r1_fallback_level': r1_fallback_level,
+            'r1_industry_overlap': r1_industry_overlap,
+            'r2_senior_id': r2_senior_id, 'r2_score': r2_score,
+            'r2_load_type': r2_load_type, 'r2_fallback_level': r2_fallback_level,
+            'r2_industry_overlap': r2_industry_overlap,
+            'same_senior_r1_r2': same_senior_r1_r2,
+            'log_entry': log_entry,
+        }
+
+    print(f"\n  Phase 2 complete:")
+    print(f"    Fallback matched: {len(fallback_juniors) - len(manual_intervention_cases)}")
+    print(f"    Manual intervention required: {len(manual_intervention_cases)}")
+
+    # ===========================================================================
+    # BUILD RESULTS — preserve original junior order
+    # ===========================================================================
+    for jr_idx, junior_row in df_juniors.iterrows():
+        jr_id = junior_row["J_ID"]
+        data  = phase1_results.get(jr_id)
+        if data is None:
+            continue  # should not happen
+
+        log_entry           = data['log_entry']
+        r1_senior_id        = data['r1_senior_id']
+        r2_senior_id        = data['r2_senior_id']
+        r1_score            = data['r1_score']
+        r2_score            = data['r2_score']
+        r1_load_type        = data['r1_load_type']
+        r2_load_type        = data['r2_load_type']
+        r1_fallback_level   = data['r1_fallback_level']
+        r2_fallback_level   = data['r2_fallback_level']
+        r1_industry_overlap = data['r1_industry_overlap']
+        r2_industry_overlap = data['r2_industry_overlap']
+        same_senior_r1_r2   = data['same_senior_r1_r2']
+
         debug_logs.append(log_entry)
-        
-        # Add to manual review if conditions met
+
+        # Manual review flags
         should_review = False
         review_reasons = []
-        
         if get_confidence_label(r1_score, 100) == "LOW":
-            should_review = True
-            review_reasons.append("R1:LOW_CONFIDENCE")
-        
+            should_review = True; review_reasons.append("R1:LOW_CONFIDENCE")
         if get_confidence_label(r2_score, 80) == "LOW":
-            should_review = True
-            review_reasons.append("R2:LOW_CONFIDENCE")
-        
+            should_review = True; review_reasons.append("R2:LOW_CONFIDENCE")
         if r1_load_type == "FORCED_OVERLOAD" or r2_load_type == "FORCED_OVERLOAD":
-            should_review = True
-            review_reasons.append("OVERLOAD")
-        
-        if same_senior_r1_r2 and fallback_level_r1 > 2:
-            should_review = True
-            review_reasons.append("SAME_SENIOR")
-        
-        if fallback_level_r1 > 3 or fallback_level_r2 > 3:
-            should_review = True
-            review_reasons.append("HIGH_FALLBACK")
-        
-        # ===== BUILD RESULT RECORD =====
+            should_review = True; review_reasons.append("OVERLOAD")
+        if same_senior_r1_r2 and r1_fallback_level > 2:
+            should_review = True; review_reasons.append("SAME_SENIOR")
+        if r1_fallback_level > 3 or r2_fallback_level > 3:
+            should_review = True; review_reasons.append("HIGH_FALLBACK")
+        if r1_senior_id is None or r2_senior_id is None:
+            should_review = True; review_reasons.append("UNMATCHED_ROUND")
+
+        if should_review:
+            manual_review_records.append({'J_ID': jr_id, 'Review_Reasons': "; ".join(review_reasons)})
+
         r1_senior = df_seniors[df_seniors["S_ID"] == r1_senior_id].iloc[0] if r1_senior_id else None
         r2_senior = df_seniors[df_seniors["S_ID"] == r2_senior_id].iloc[0] if r2_senior_id else None
-        
+
         result_record = {
             'J_ID': jr_id,
             'Junior_Name': junior_row.get('Student Name (FN LN)', ''),
@@ -1419,11 +1583,11 @@ def match_juniors_with_seniors(
             'Junior_UG_Degree': junior_row["Undergraduate Degree"],
             'Junior_UG_Spec': junior_row["Area of Specialization"],
             'Junior_Exp_Months': junior_row["Experience_Months"],
-            
+
             'R1_Senior_ID': r1_senior_id,
             'R1_Senior_Name': r1_senior['Student Name (FN LN)'] if r1_senior is not None else 'N/A',
             # 'R1_Senior_Email': r1_senior.get('Email Address', '') if r1_senior is not None else 'N/A',
-            #'R1_Senior_Phone': r1_senior.get('Phone Number', '') if r1_senior is not None else 'N/A',
+            # 'R1_Senior_Phone': r1_senior.get('Phone Number', '') if r1_senior is not None else 'N/A',
             'R1_CA': r1_senior["Is CA"] if r1_senior is not None else 'N/A',
             'R1_UG': r1_senior["Undergrad Category"] if r1_senior is not None else 'N/A',
             'R1_UG_Degree': r1_senior["Undergraduate Degree"] if r1_senior is not None else 'N/A',
@@ -1431,10 +1595,10 @@ def match_juniors_with_seniors(
             'R1_Exp_Months': r1_senior["Experience_Months"] if r1_senior is not None else 'N/A',
             'R1_Score': r1_score,
             'R1_Confidence': get_confidence_label(r1_score, 100),
-            'R1_Fallback_Level': fallback_level_r1,
+            'R1_Fallback_Level': r1_fallback_level,
             'R1_Load_Type': r1_load_type,
             'R1_Industry_Overlap': r1_industry_overlap,
-            
+
             'R2_Senior_ID': r2_senior_id,
             'R2_Senior_Name': r2_senior['Student Name (FN LN)'] if r2_senior is not None else 'N/A',
             # 'R2_Senior_Email': r2_senior.get('Email Address', '') if r2_senior is not None else 'N/A',
@@ -1446,30 +1610,33 @@ def match_juniors_with_seniors(
             'R2_Exp_Months': r2_senior["Experience_Months"] if r2_senior is not None else 'N/A',
             'R2_Score': r2_score,
             'R2_Confidence': get_confidence_label(r2_score, 80),
-            'R2_Fallback_Level': fallback_level_r2,
+            'R2_Fallback_Level': r2_fallback_level,
             'R2_Load_Type': r2_load_type,
             'R2_Industry_Overlap': r2_industry_overlap,
-            
+
             'Same_Senior_R1_R2': same_senior_r1_r2,
             'Manual_Review': should_review,
-            'Review_Reasons': "; ".join(review_reasons) if review_reasons else ""
+            'Review_Reasons': "; ".join(review_reasons) if review_reasons else "",
+            'Allocation_Phase': log_entry.get('Phase', 'Phase1'),
         }
-        
         results.append(result_record)
-    
+
     results_df = pd.DataFrame(results)
-    
+
     print(f"\n✓ Matched {len(results_df)} juniors")
-    print(f"  Round 1 - HIGH confidence: {len(results_df[results_df['R1_Confidence'] == 'HIGH'])}")
+    print(f"  Round 1 - HIGH confidence:   {len(results_df[results_df['R1_Confidence'] == 'HIGH'])}")
     print(f"  Round 1 - MEDIUM confidence: {len(results_df[results_df['R1_Confidence'] == 'MEDIUM'])}")
-    print(f"  Round 1 - LOW confidence: {len(results_df[results_df['R1_Confidence'] == 'LOW'])}")
-    print(f"\n  Round 2 - HIGH confidence: {len(results_df[results_df['R2_Confidence'] == 'HIGH'])}")
+    print(f"  Round 1 - LOW confidence:    {len(results_df[results_df['R1_Confidence'] == 'LOW'])}")
+    print(f"\n  Round 2 - HIGH confidence:   {len(results_df[results_df['R2_Confidence'] == 'HIGH'])}")
     print(f"  Round 2 - MEDIUM confidence: {len(results_df[results_df['R2_Confidence'] == 'MEDIUM'])}")
-    print(f"  Round 2 - LOW confidence: {len(results_df[results_df['R2_Confidence'] == 'LOW'])}")
-    
-    manual_review_df = pd.DataFrame(manual_review_records) if manual_review_records else pd.DataFrame()
-    
-    return results_df, debug_logs, manual_review_df, senior_load_r1, senior_load_r2, senior_load_total
+    print(f"  Round 2 - LOW confidence:    {len(results_df[results_df['R2_Confidence'] == 'LOW'])}")
+
+    manual_review_df        = pd.DataFrame(manual_review_records) if manual_review_records else pd.DataFrame()
+    manual_intervention_df  = pd.DataFrame(manual_intervention_cases) if manual_intervention_cases else pd.DataFrame()
+
+    return (results_df, debug_logs, manual_review_df,
+            senior_load_r1, senior_load_r2, senior_load_total,
+            manual_intervention_df)
 
 
 # =============================================================================
@@ -1790,11 +1957,12 @@ def save_outputs(
     senior_load_r2: Dict,
     senior_load_total: Dict,
     df_seniors: pd.DataFrame,
+    manual_intervention_df: pd.DataFrame,
     output_dir: str = "."
 ) -> None:
     """
     Save all output files with separate load tracking.
-    
+
     Args:
         results_df: Final matching results
         segment_health: Segment health report
@@ -1804,28 +1972,44 @@ def save_outputs(
         senior_load_r2: R2-specific loads
         senior_load_total: Total loads
         df_seniors: Seniors DataFrame
+        manual_intervention_df: Juniors that could not be matched after all fallback levels
         output_dir: Output directory
     """
     print("\n" + "="*80)
     print("STEP 20-21: SAVING OUTPUT FILES")
     print("="*80)
-    
+
     # Final output
     output_file = f"{output_dir}/final_output.xlsx"
     results_df.to_excel(output_file, index=False)
     print(f"✓ Saved final output: {output_file}")
-    
+
     # Segment health
     health_file = f"{output_dir}/segment_health.xlsx"
     segment_health.to_excel(health_file, index=False)
     print(f"✓ Saved segment health: {health_file}")
-    
+
     # Manual review
     if len(manual_review_df) > 0:
         review_file = f"{output_dir}/manual_review.xlsx"
         manual_review_df.to_excel(review_file, index=False)
         print(f"✓ Saved manual review ({len(manual_review_df)} records): {review_file}")
-    
+
+    # Manual intervention (unresolvable after full fallback)
+    if manual_intervention_df is not None and len(manual_intervention_df) > 0:
+        intervention_file = f"{output_dir}/manual_intervention_required.xlsx"
+        # Ensure expected column order
+        col_order = [
+            'J_ID', 'Junior_Name', 'Original_Segment',
+            'Reason_for_Failure', 'Candidate_Segments_Checked',
+            'Best_Available_Score',
+        ]
+        existing_cols = [c for c in col_order if c in manual_intervention_df.columns]
+        manual_intervention_df[existing_cols].to_excel(intervention_file, index=False)
+        print(f"✓ Saved manual intervention ({len(manual_intervention_df)} records): {intervention_file}")
+    else:
+        print(f"✓ No manual intervention cases — all juniors matched successfully")
+
     # Analytics report
     analytics_file = f"{output_dir}/analytics_report.xlsx"
     generate_analytics_report(
@@ -1833,7 +2017,7 @@ def save_outputs(
         senior_load_r1, senior_load_r2, senior_load_total,
         debug_logs, df_seniors, analytics_file
     )
-    
+
     # Debug report
     debug_file = f"{output_dir}/matching_debug.txt"
     generate_debug_report(debug_logs, senior_load_r1, senior_load_r2, senior_load_total, df_seniors, debug_file)
@@ -1866,8 +2050,8 @@ def main(junior_file: str = "Bo'27.xlsx", senior_file: str = "Bo'26.xlsx") -> No
     print("\n")
     print("█" * 80)
     print("█" + " " * 78 + "█")
-    print("█" + "  MENTORSHIP ALLOCATION MATCHING ENGINE - PRODUCTION v3.0".center(78) + "█")
-    print("█" + "  (IMPROVED: Separated Loads, Fair Shuffling, Deterministic Tie-Breaking)".center(78) + "█")
+    print("█" + "  MENTORSHIP ALLOCATION MATCHING ENGINE - PRODUCTION v4.0".center(78) + "█")
+    print("█" + "  (IMPROVED: Two-Phase Deferred Fallback Allocation Strategy)".center(78) + "█")
     print("█" + " " * 78 + "█")
     print("█" * 80)
     
@@ -1880,9 +2064,6 @@ def main(junior_file: str = "Bo'27.xlsx", senior_file: str = "Bo'26.xlsx") -> No
         # STEP 2: Create IDs
         create_ids(df_juniors, df_seniors)
         
-        # STEP 2.5: Fair shuffling (removes sequential bias)
-        df_juniors = shuffle_juniors_fair(df_juniors)
-        
         # STEP 3-4: Clean data
         print("\n" + "="*80)
         print("STEP 3-4: DATA CLEANING & NORMALIZATION")
@@ -1891,6 +2072,11 @@ def main(junior_file: str = "Bo'27.xlsx", senior_file: str = "Bo'26.xlsx") -> No
         df_seniors = clean_dataframe(df_seniors, "senior")
         print(f"✓ Cleaned {len(df_juniors)} juniors and {len(df_seniors)} seniors")
         
+        # STEP 4.5: Fair shuffling (removes sequential bias)
+        #df_juniors = shuffle_juniors_fair(df_juniors)
+        #shuffle juniors based on work experience with more experienced juniors first
+        df_juniors = df_juniors.sort_values(by="Experience_Months", ascending=False).reset_index(drop=True)
+
         # STEP 5: Create segments
         print("\n" + "="*80)
         print("STEP 5: SEGMENT CREATION")
@@ -1932,19 +2118,22 @@ def main(junior_file: str = "Bo'27.xlsx", senior_file: str = "Bo'26.xlsx") -> No
             jr_industries_dict, sr_industries_dict
         )
         
-        # STEP 13-16: Main matching with improved logic
-        results_df, debug_logs, manual_review_df, senior_load_r1, senior_load_r2, senior_load_total = match_juniors_with_seniors(
+        # STEP 13-16: Main matching — two-phase deferred fallback strategy
+        (results_df, debug_logs, manual_review_df,
+         senior_load_r1, senior_load_r2, senior_load_total,
+         manual_intervention_df) = match_juniors_with_seniors(
             df_juniors, df_seniors,
             junior_segments, senior_segments,
             r1_scores, r2_scores,
             segment_health,
             jr_industries_dict, sr_industries_dict
         )
-        
+
         # STEP 20-21: Save outputs
         save_outputs(
             results_df, segment_health, manual_review_df,
-            debug_logs, senior_load_r1, senior_load_r2, senior_load_total, df_seniors
+            debug_logs, senior_load_r1, senior_load_r2, senior_load_total,
+            df_seniors, manual_intervention_df
         )
         
         print("\n" + "█" * 80)
@@ -1956,14 +2145,17 @@ def main(junior_file: str = "Bo'27.xlsx", senior_file: str = "Bo'26.xlsx") -> No
         print("  3. manual_review.xlsx - Cases requiring human review")
         print("  4. analytics_report.xlsx - Comprehensive statistics & fairness metrics")
         print("  5. matching_debug.txt - Detailed decision logs with separated loads")
-        print("\nKey Improvements:")
+        print("  6. manual_intervention_required.xlsx - Juniors unresolvable after all fallback levels")
+        print("\nKey Improvements (v4.0):")
+        print("  ✓ Phase 1: Strict same-segment matching — no cross-segment capacity consumed")
+        print("  ✓ Phase 2: Deferred fallback — runs only after Phase 1 fully exhausted")
+        print("  ✓ Manual intervention export for truly unresolvable cases")
         print("  ✓ Separate load tracking for R1 and R2")
         print("  ✓ Fair junior shuffling (removes sequential bias)")
         print("  ✓ Deterministic tie-breaking (score > load > industry > index)")
         print("  ✓ Input validation before matching")
         print("  ✓ CONFIG-based customization")
         print("  ✓ Enhanced debug logging")
-        print("  ✓ Comprehensive analytics report")
         print("\n")
         
     except Exception as e:
