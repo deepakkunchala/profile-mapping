@@ -5,7 +5,7 @@
 ================================================================================
 
 PURPOSE:
-    Match Juniors (Bo'27) with Seniors (Bo'26) for CV vetting mentorship.
+    Match Juniors with Seniors for CV vetting mentorship.
     Each junior receives 2 seniors (prefer different in Round 1 and Round 2).
 
 ARCHITECTURE:
@@ -166,9 +166,8 @@ def load_data(junior_file: str, senior_file: str) -> Tuple[pd.DataFrame, pd.Data
     Load junior and senior data from Excel files.
     
     Args:
-        junior_file: Path to Bo'27.xlsx
-        senior_file: Path to Bo'26.xlsx
-    
+        junior_file: Path to Seniors.xlsx
+        senior_file: Path to Juniors.xlsx
     Returns:
         Tuple of (df_juniors, df_seniors)
     
@@ -2035,7 +2034,7 @@ def save_outputs(
 #                           MAIN EXECUTION
 # =============================================================================
 
-def main(junior_file: str = "Bo'27.xlsx", senior_file: str = "Bo'26.xlsx") -> None:
+def main(junior_file: str = "Juniors.xlsx", senior_file: str = "Seniors.xlsx") -> None:
     """
     Main execution function. Orchestrates the entire matching process with improvements.
     
