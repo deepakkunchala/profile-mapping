@@ -72,8 +72,8 @@ CONFIG = {
     },
     
     # Confidence thresholds
-    'CONFIDENCE_R1': {'HIGH': 80, 'MEDIUM': 60},  # % of max score
-    'CONFIDENCE_R2': {'HIGH': 80, 'MEDIUM': 60},  # % of max score
+    'CONFIDENCE_R1': {'HIGH': 60, 'MEDIUM': 40},  # % of max score
+    'CONFIDENCE_R2': {'HIGH': 60, 'MEDIUM': 40},  # % of max score
 }
 
 # For backward compatibility, expose commonly used values
@@ -1080,9 +1080,9 @@ def get_confidence_label(score: float, max_score: float = 100.0) -> str:
     """
     percentage = (score / max_score) * 100
     
-    if percentage >= 80:
+    if percentage >= 60:
         return "HIGH"
-    elif percentage >= 60:
+    elif percentage >= 40:
         return "MEDIUM"
     else:
         return "LOW"
@@ -1582,6 +1582,8 @@ def match_juniors_with_seniors(
             'Junior_UG': junior_row["Undergrad Category"],
             'Junior_UG_Degree': junior_row["Undergraduate Degree"],
             'Junior_UG_Spec': junior_row["Area of Specialization"],
+            'Junior_Masters_Degree': junior_row["Masters_Degree"],
+            'Junior_Masters_Specialization': junior_row["Masters_Specialization"],
             'Junior_Exp_Months': junior_row["Experience_Months"],
 
             'R1_Senior_ID': r1_senior_id,
@@ -1592,6 +1594,8 @@ def match_juniors_with_seniors(
             'R1_UG': r1_senior["Undergrad Category"] if r1_senior is not None else 'N/A',
             'R1_UG_Degree': r1_senior["Undergraduate Degree"] if r1_senior is not None else 'N/A',
             'R1_UG_Spec': r1_senior["Area of Specialization"] if r1_senior is not None else 'N/A',
+            'R1_Masters_Degree': r1_senior["Masters_Degree"] if r1_senior is not None else 'N/A',
+            'R1_Masters_Specialization': r1_senior["Masters_Specialization"] if r1_senior is not None else 'N/A',
             'R1_Exp_Months': r1_senior["Experience_Months"] if r1_senior is not None else 'N/A',
             'R1_Score': r1_score,
             'R1_Confidence': get_confidence_label(r1_score, 100),
@@ -1607,6 +1611,8 @@ def match_juniors_with_seniors(
             'R2_UG': r2_senior["Undergrad Category"] if r2_senior is not None else 'N/A',
             'R2_UG_Degree': r2_senior["Undergraduate Degree"] if r2_senior is not None else 'N/A',
             'R2_UG_Spec': r2_senior["Area of Specialization"] if r2_senior is not None else 'N/A',
+            'R2_Masters_Degree': r2_senior["Masters_Degree"] if r2_senior is not None else 'N/A',
+            'R2_Masters_Specialization': r2_senior["Masters_Specialization"] if r2_senior is not None else 'N/A',
             'R2_Exp_Months': r2_senior["Experience_Months"] if r2_senior is not None else 'N/A',
             'R2_Score': r2_score,
             'R2_Confidence': get_confidence_label(r2_score, 80),
